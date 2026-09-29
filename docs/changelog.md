@@ -160,6 +160,10 @@ As features stabilize some brief notes about them will accumulate here.
   `CTRL-u` to kill back to the start of the line. Thanks to @bew! #8013
 
 #### Fixed
+* mux: Drag pane dividers to absolute positions so delayed resize updates do not
+  compound mouse movement. Preserve nested split coordinates and relative
+  keyboard resize steps. Based on [PR #6062](https://github.com/wezterm/wezterm/pull/6062)
+  by @yshui; partially addresses [#5142](https://github.com/wezterm/wezterm/issues/5142).
 * macOS: Fix window border when opacity<1 and shadow enabled.
   Thanks to @Adams-Galaxy! #8038 #5158
 * perf: Terminal images were hashed three times each on the transmit path; the sha256

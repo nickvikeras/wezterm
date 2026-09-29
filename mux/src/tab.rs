@@ -630,11 +630,10 @@ impl Tab {
             .rebuild_splits_sizes_from_contained_panes()
     }
 
-    /// Given split_index, the topological index of a split returned by
-    /// iter_splits() as PositionedSplit::index, revised the split position
-    /// by the provided delta; positive values move the split to the right/bottom,
-    /// and negative values to the left/top.
-    /// The adjusted size is propogated downwards to contained children and
+    /// Given the topological index returned by iter_splits(), set the split's
+    /// column or row relative to the tab's top-left corner. The position is
+    /// clamped to leave at least one cell on either side of the divider.
+    /// The adjusted size is propagated downwards to contained children and
     /// their panes are resized accordingly.
     pub fn resize_split_to(&self, split_index: usize, left_or_top: isize) {
         self.inner.lock().resize_split_to(split_index, left_or_top)
@@ -1285,8 +1284,24 @@ impl TabInner {
             }
         }
 
-        // Now cursor is looking at the split
-        self.adjust_node_at_cursor(&mut cursor, left_or_top);
+        // Convert the tab coordinate to the size of this split's first child.
+        let mut left = 0;
+        let mut top = 0;
+        for (branch, parent) in cursor.path_to_root() {
+            if let Some(parent) = parent {
+                if branch == PathBranch::IsRight {
+                    left += parent.left_of_second();
+                    top += parent.top_of_second();
+                }
+            }
+        }
+        if let Ok(Some(node)) = cursor.node_mut() {
+            let origin = match node.direction {
+                SplitDirection::Horizontal => left,
+                SplitDirection::Vertical => top,
+            };
+            self.adjust_node_at_cursor(&mut cursor, left_or_top.saturating_sub(origin as isize));
+        }
         self.cascade_size_from_cursor(cursor);
         Mux::try_get().map(|mux| mux.notify(MuxNotification::TabResized(self.id)));
     }
@@ -1298,10 +1313,7 @@ impl TabInner {
                 SplitDirection::Horizontal => {
                     let width = node.width();
 
-                    let mut cols = node.first.cols as isize;
-                    cols = left_or_top
-                        .max(1)
-                        .min((width as isize).saturating_sub(2));
+                    let cols = left_or_top.max(1).min((width as isize).saturating_sub(2));
                     node.first.cols = cols as usize;
                     node.first.pixel_width =
                         node.first.cols.saturating_mul(cell_dimensions.pixel_width);
@@ -1313,10 +1325,7 @@ impl TabInner {
                 SplitDirection::Vertical => {
                     let height = node.height();
 
-                    let mut rows = node.first.rows as isize;
-                    rows = left_or_top
-                        .max(1)
-                        .min((height as isize).saturating_sub(2));
+                    let rows = left_or_top.max(1).min((height as isize).saturating_sub(2));
                     node.first.rows = rows as usize;
                     node.first.pixel_height =
                         node.first.rows.saturating_mul(cell_dimensions.pixel_height);
@@ -1417,7 +1426,14 @@ impl TabInner {
                 Ok(mut c) => {
                     if let Ok(Some(node)) = c.node_mut() {
                         if node.direction == split_direction {
-                            self.adjust_node_at_cursor(&mut c, delta);
+                            let position = match split_direction {
+                                SplitDirection::Horizontal => node.first.cols,
+                                SplitDirection::Vertical => node.first.rows,
+                            };
+                            self.adjust_node_at_cursor(
+                                &mut c,
+                                (position as isize).saturating_add(delta),
+                            );
                             self.cascade_size_from_cursor(c);
                             return;
                         }
@@ -2513,6 +2529,93 @@ mod test {
         assert_eq!(24, panes[2].height);
         assert_eq!(400, panes[2].pixel_width);
         assert_eq!(600, panes[2].pixel_height);
+    }
+
+    fn tab_with_nested_split(direction: SplitDirection) -> Tab {
+        let size = TerminalSize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 800,
+            pixel_height: 600,
+            dpi: 96,
+        };
+        let tab = Tab::new(&size);
+        tab.assign_pane(&FakePane::new(1, size));
+        for index in 0..2 {
+            let request = SplitRequest {
+                direction,
+                ..Default::default()
+            };
+            let split_size = tab.compute_split_size(index, request).unwrap();
+            tab.split_and_insert(index, request, FakePane::new(index + 2, split_size.second))
+                .unwrap();
+        }
+        tab
+    }
+
+    #[test]
+    fn resize_split_to_uses_tab_coordinates() {
+        for direction in [SplitDirection::Horizontal, SplitDirection::Vertical] {
+            let tab = tab_with_nested_split(direction);
+            let panes = tab.iter_panes();
+            let origin = match direction {
+                SplitDirection::Horizontal => panes[1].left,
+                SplitDirection::Vertical => panes[1].top,
+            };
+            let target = (origin + 3) as isize;
+            tab.resize_split_to(1, target);
+            let split = tab.iter_splits()[1];
+            let position = match direction {
+                SplitDirection::Horizontal => split.left,
+                SplitDirection::Vertical => split.top,
+            };
+            assert_eq!(position, target as usize, "{direction:?}");
+
+            let panes = tab.iter_panes();
+            match direction {
+                SplitDirection::Horizontal => {
+                    assert_eq!(panes[1].width, 3);
+                    assert_eq!(panes[2].left + panes[2].width, 80);
+                }
+                SplitDirection::Vertical => {
+                    assert_eq!(panes[1].height, 3);
+                    assert_eq!(panes[2].top + panes[2].height, 24);
+                }
+            }
+
+            // A stale server position must not change the final drag target.
+            tab.resize_split_to(1, target + 1);
+            tab.resize_split_to(1, target);
+            tab.resize_split_to(1, target);
+            assert_eq!(tab.iter_splits()[1], split);
+        }
+    }
+
+    #[test]
+    fn adjust_pane_size_preserves_relative_steps() {
+        for (direction, forward, backward) in [
+            (
+                SplitDirection::Horizontal,
+                PaneDirection::Right,
+                PaneDirection::Left,
+            ),
+            (
+                SplitDirection::Vertical,
+                PaneDirection::Down,
+                PaneDirection::Up,
+            ),
+        ] {
+            let tab = tab_with_nested_split(direction);
+            let before = tab.iter_splits()[1];
+            tab.adjust_pane_size(forward, 2);
+            let after = tab.iter_splits()[1];
+            match direction {
+                SplitDirection::Horizontal => assert_eq!(after.left, before.left + 2),
+                SplitDirection::Vertical => assert_eq!(after.top, before.top + 2),
+            }
+            tab.adjust_pane_size(backward, 2);
+            assert_eq!(tab.iter_splits()[1], before);
+        }
     }
 
     fn is_send_and_sync<T: Send + Sync>() -> bool {
