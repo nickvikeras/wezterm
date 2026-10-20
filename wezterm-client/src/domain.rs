@@ -17,6 +17,44 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use wezterm_term::TerminalSize;
 
+/// The title that the server holds, as far as this client knows, for each
+/// remote tab. A title is recorded when the server reports it and when this
+/// client sends it.
+///
+/// The client uses this to send only titles that originate locally. Applying a
+/// title reported by the server fires the same local `TabTitleChanged`
+/// notification as a local rename. Without this record the client would send
+/// every server-reported title straight back. When two different titles are
+/// in flight in opposite directions, each side then keeps replacing its title
+/// with the other's stale value, and the tab title alternates forever.
+#[derive(Default)]
+struct KnownServerTabTitles {
+    by_remote_tab: HashMap<TabId, String>,
+}
+
+impl KnownServerTabTitles {
+    /// Records that the server reported `title` for `remote_tab_id`.
+    fn record_from_server(&mut self, remote_tab_id: TabId, title: &str) {
+        self.by_remote_tab.insert(remote_tab_id, title.to_string());
+    }
+
+    /// Returns true when a local title change must be sent to the server,
+    /// and records that the server is about to hold `title`. Returns false
+    /// when the server already holds `title`, which includes the case where
+    /// the change came from the server itself.
+    fn should_send(&mut self, remote_tab_id: TabId, title: &str) -> bool {
+        if self.by_remote_tab.get(&remote_tab_id).map(String::as_str) == Some(title) {
+            return false;
+        }
+        self.record_from_server(remote_tab_id, title);
+        true
+    }
+
+    fn forget(&mut self, remote_tab_id: TabId) {
+        self.by_remote_tab.remove(&remote_tab_id);
+    }
+}
+
 pub struct ClientInner {
     pub client: Client,
     pub local_domain_id: DomainId,
@@ -25,6 +63,7 @@ pub struct ClientInner {
     remote_to_local_window: Mutex<HashMap<WindowId, WindowId>>,
     remote_to_local_tab: Mutex<HashMap<TabId, TabId>>,
     remote_to_local_pane: Mutex<HashMap<PaneId, PaneId>>,
+    known_server_tab_titles: Mutex<KnownServerTabTitles>,
     pub focused_remote_pane_id: Mutex<Option<PaneId>>,
 }
 
@@ -245,6 +284,7 @@ impl ClientInner {
             remote_to_local_window: Mutex::new(HashMap::new()),
             remote_to_local_tab: Mutex::new(HashMap::new()),
             remote_to_local_pane: Mutex::new(HashMap::new()),
+            known_server_tab_titles: Mutex::new(KnownServerTabTitles::default()),
             focused_remote_pane_id: Mutex::new(None),
         }
     }
@@ -341,16 +381,23 @@ fn mux_notify_client_domain(local_domain_id: DomainId, notif: MuxNotification) -
         MuxNotification::TabTitleChanged { tab_id, title } => {
             if let Some(remote_tab_id) = client_domain.local_to_remote_tab_id(tab_id) {
                 if let Some(inner) = client_domain.inner() {
-                    promise::spawn::spawn(async move {
-                        inner
-                            .client
-                            .set_tab_title(codec::TabTitleChanged {
-                                tab_id: remote_tab_id,
-                                title,
-                            })
-                            .await
-                    })
-                    .detach();
+                    let needs_send = inner
+                        .known_server_tab_titles
+                        .lock()
+                        .unwrap()
+                        .should_send(remote_tab_id, &title);
+                    if needs_send {
+                        promise::spawn::spawn(async move {
+                            inner
+                                .client
+                                .set_tab_title(codec::TabTitleChanged {
+                                    tab_id: remote_tab_id,
+                                    title,
+                                })
+                                .await
+                        })
+                        .detach();
+                    }
                 }
             }
         }
@@ -493,6 +540,11 @@ impl ClientDomain {
 
     pub fn process_remote_tab_title_change(&self, remote_tab_id: TabId, title: String) {
         if let Some(inner) = self.inner() {
+            inner
+                .known_server_tab_titles
+                .lock()
+                .unwrap()
+                .record_from_server(remote_tab_id, &title);
             if let Some(local_tab_id) = inner.remote_to_local_tab_id(remote_tab_id) {
                 if let Some(tab) = Mux::get().get_tab(local_tab_id) {
                     tab.set_title(&title);
@@ -573,6 +625,11 @@ impl ClientDomain {
                     inner.record_remote_to_local_tab_mapping(remote_tab_id, tab.tab_id());
                 }
 
+                inner
+                    .known_server_tab_titles
+                    .lock()
+                    .unwrap()
+                    .record_from_server(remote_tab_id, tab_title);
                 tab.set_title(tab_title);
 
                 log::debug!("domain: {} tree: {:#?}", inner.local_domain_id, tabroot);
@@ -693,8 +750,10 @@ impl ClientDomain {
         }
         if !remote_tabs_to_forget.is_empty() {
             let mut tabs = inner.remote_to_local_tab.lock().unwrap();
+            let mut titles = inner.known_server_tab_titles.lock().unwrap();
             for t in remote_tabs_to_forget {
                 tabs.remove(&t);
+                titles.forget(t);
             }
         }
         if !remote_panes_to_forget.is_empty() {
@@ -1004,5 +1063,46 @@ impl Domain for ClientDomain {
         } else {
             DomainState::Detached
         }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::KnownServerTabTitles;
+
+    /// Replays the exchange that made tab titles alternate forever: the
+    /// client renames a tab twice in a row, and the server then reports both
+    /// titles back in order. The reported titles must not be sent again.
+    #[test]
+    fn server_reported_titles_are_not_sent_back() {
+        let mut known = KnownServerTabTitles::default();
+        known.record_from_server(7, "initial");
+
+        assert!(known.should_send(7, "first"));
+        assert!(known.should_send(7, "second"));
+
+        known.record_from_server(7, "first");
+        assert!(!known.should_send(7, "first"));
+        known.record_from_server(7, "second");
+        assert!(!known.should_send(7, "second"));
+    }
+
+    #[test]
+    fn local_rename_back_to_earlier_title_is_sent() {
+        let mut known = KnownServerTabTitles::default();
+        known.record_from_server(7, "first");
+
+        assert!(known.should_send(7, "second"));
+        assert!(known.should_send(7, "first"));
+        assert!(!known.should_send(7, "first"));
+    }
+
+    #[test]
+    fn forgotten_tab_sends_its_next_title() {
+        let mut known = KnownServerTabTitles::default();
+        known.record_from_server(7, "title");
+        known.forget(7);
+
+        assert!(known.should_send(7, "title"));
     }
 }
