@@ -19,7 +19,7 @@ use portable_pty::Child;
 use smol::channel::{bounded, unbounded, Receiver, Sender};
 use smol::prelude::*;
 use smol::{block_on, Async};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::marker::Unpin;
 use std::net::TcpStream;
@@ -337,6 +337,40 @@ enum NotReconnectableError {
     ClientWasDestroyed,
 }
 
+/// The `SetFocusedPane` requests that this connection has sent and that the
+/// server has not answered yet, oldest first.
+///
+/// The server handles `SetFocusedPane` by broadcasting `PaneFocused` for that
+/// pane and only then sending the response, so the requests and notifications
+/// arrive here in the order the server processed them. While a request is
+/// unanswered, a `PaneFocused` for a pane other than the newest requested one
+/// is stale: it is either the server repeating an earlier request from this
+/// client, or a focus change that the server is about to override with the
+/// newest request. Applying it would refocus the old pane locally, which makes
+/// this client request the old pane again. With two requests in flight, the
+/// focus then alternates between the two panes forever.
+#[derive(Default)]
+struct UnansweredFocusRequests {
+    requests: VecDeque<(u64, PaneId)>,
+}
+
+impl UnansweredFocusRequests {
+    fn record_request(&mut self, serial: u64, pane_id: PaneId) {
+        self.requests.push_back((serial, pane_id));
+    }
+
+    fn record_response(&mut self, serial: u64) {
+        self.requests
+            .retain(|(request_serial, _)| *request_serial != serial);
+    }
+
+    /// Returns true when a `PaneFocused` for `pane_id` received now must be
+    /// ignored, because a newer unanswered request focuses a different pane.
+    fn is_stale(&self, pane_id: PaneId) -> bool {
+        matches!(self.requests.back(), Some((_, newest)) if *newest != pane_id)
+    }
+}
+
 fn client_thread(
     reconnectable: &mut Reconnectable,
     local_domain_id: Option<DomainId>,
@@ -373,6 +407,7 @@ async fn client_thread_async(
     let mut promises = Promises {
         map: HashMap::new(),
     };
+    let mut unanswered_focus_requests = UnansweredFocusRequests::default();
 
     let mut stream = reconnectable.take_stream().unwrap();
 
@@ -387,6 +422,9 @@ async fn client_thread_async(
                 let serial = next_serial;
                 next_serial += 1;
                 promises.map.insert(serial, promise);
+                if let Pdu::SetFocusedPane(SetFocusedPane { pane_id }) = &pdu {
+                    unanswered_focus_requests.record_request(serial, *pane_id);
+                }
 
                 pdu.encode_async(&mut stream, serial)
                     .await
@@ -402,6 +440,15 @@ async fn client_thread_async(
                             decoded.pdu.pdu_name()
                         );
                         if decoded.serial == 0 {
+                            if let Pdu::PaneFocused(PaneFocused { pane_id }) = &decoded.pdu {
+                                if unanswered_focus_requests.is_stale(*pane_id) {
+                                    log::debug!(
+                                        "ignoring PaneFocused for pane {pane_id}: \
+                                         a newer focus request is unanswered"
+                                    );
+                                    continue;
+                                }
+                            }
                             process_unilateral(local_domain_id, decoded)
                                 .context("processing unilateral PDU from server")
                                 .map_err(|e| {
@@ -409,6 +456,7 @@ async fn client_thread_async(
                                     e
                                 })?;
                         } else if let Some(promise) = promises.map.remove(&decoded.serial) {
+                            unanswered_focus_requests.record_response(decoded.serial);
                             if promise.try_send(Ok(decoded.pdu)).is_err() {
                                 return Err(NotReconnectableError::ClientWasDestroyed.into());
                             }
@@ -1389,4 +1437,36 @@ impl Client {
         GetPaneDirectionResponse
     );
     rpc!(adjust_pane_size, AdjustPaneSize, UnitResponse);
+}
+
+#[cfg(test)]
+mod test {
+    use super::UnansweredFocusRequests;
+
+    /// Replays the exchange that made the focus alternate forever: the client
+    /// focuses pane 1 and then pane 2, and the server reports each focus
+    /// change just before answering the request that caused it.
+    #[test]
+    fn report_of_superseded_request_is_stale() {
+        let mut requests = UnansweredFocusRequests::default();
+        requests.record_request(10, 1);
+        requests.record_request(11, 2);
+
+        assert!(requests.is_stale(1));
+        requests.record_response(10);
+        assert!(!requests.is_stale(2));
+    }
+
+    /// Once every request is answered, a focus change made elsewhere, such as
+    /// `wezterm cli activate-pane` on the server, must be applied.
+    #[test]
+    fn focus_change_after_all_responses_is_applied() {
+        let mut requests = UnansweredFocusRequests::default();
+        requests.record_request(10, 1);
+        requests.record_request(11, 2);
+        requests.record_response(10);
+        requests.record_response(11);
+
+        assert!(!requests.is_stale(3));
+    }
 }

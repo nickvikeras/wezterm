@@ -160,6 +160,14 @@ As features stabilize some brief notes about them will accumulate here.
   `CTRL-u` to kill back to the start of the line. Thanks to @bew! #8013
 
 #### Fixed
+* mux: Pane focus no longer gets stuck switching back and forth between two
+  panes after two quick focus changes, which also flickered the window title
+  and could freeze the GUI while its memory grew. The client ignores a
+  `PaneFocused` from the server while a newer focus request of its own is
+  unanswered, and the GUI ignores a queued `PaneFocused` whose pane is no
+  longer active in its tab. Related: [#4390](https://github.com/wezterm/wezterm/issues/4390),
+  [#7388](https://github.com/wezterm/wezterm/issues/7388),
+  [PR #6349](https://github.com/wezterm/wezterm/pull/6349).
 * mux: Drag pane dividers to absolute positions so delayed resize updates do not
   compound mouse movement. Preserve nested split coordinates and relative
   keyboard resize steps. Based on [PR #6062](https://github.com/wezterm/wezterm/pull/6062)

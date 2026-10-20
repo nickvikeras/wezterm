@@ -7,6 +7,7 @@ use anyhow::{Context, Error};
 use config::keyassignment::{KeyAssignment, SpawnCommand};
 use config::{ConfigSubscription, NotificationHandling};
 use mux::client::ClientId;
+use mux::pane::PaneId;
 use mux::window::WindowId as MuxWindowId;
 use mux::{Mux, MuxNotification};
 use promise::{Future, Promise};
@@ -80,6 +81,15 @@ impl GuiFrontEnd {
                 MuxNotification::PaneFocused(pane_id) => {
                     promise::spawn::spawn_into_main_thread(async move {
                         let mux = Mux::get();
+                        // `pane_id` was the active pane of its tab when this
+                        // notification was sent. If another pane has become
+                        // active since, the notification is stale. Refocusing
+                        // `pane_id` would undo the newer change and queue
+                        // another PaneFocused, so two stale notifications in
+                        // the queue would swap the focus back and forth forever.
+                        if !is_active_pane_of_its_tab(&mux, pane_id) {
+                            return;
+                        }
                         if let Err(err) = mux.focus_pane_and_containing_tab(pane_id) {
                             log::error!("Error reconciling PaneFocused notification: {err:#}");
                         }
@@ -501,6 +511,16 @@ impl GuiFrontEnd {
         }
         None
     }
+}
+
+/// Returns true when `pane_id` is the active pane of the tab that contains it.
+fn is_active_pane_of_its_tab(mux: &Mux, pane_id: PaneId) -> bool {
+    let Some((_domain_id, _window_id, tab_id)) = mux.resolve_pane_id(pane_id) else {
+        return false;
+    };
+    mux.get_tab(tab_id)
+        .and_then(|tab| tab.get_active_pane())
+        .map_or(false, |pane| pane.pane_id() == pane_id)
 }
 
 thread_local! {
