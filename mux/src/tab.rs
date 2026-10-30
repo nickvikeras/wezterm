@@ -383,7 +383,13 @@ fn adjust_x_size(tree: &mut Tree, mut x_adjust: isize, cell_dimensions: &Termina
                         }
                     }
                     SplitDirection::Horizontal => {
-                        // x_adjust is negative
+                        // x_adjust is negative. Once both sides are one column
+                        // wide, this split cannot shrink further; stop rather
+                        // than spin, because a parent split's recorded width
+                        // can exceed what this split is able to give up.
+                        if data.first.cols <= 1 && data.second.cols <= 1 {
+                            return;
+                        }
                         if data.first.cols > 1 {
                             adjust_x_size(&mut *left, -1, cell_dimensions);
                             data.first.cols -= 1;
@@ -454,7 +460,13 @@ fn adjust_y_size(tree: &mut Tree, mut y_adjust: isize, cell_dimensions: &Termina
                         }
                     }
                     SplitDirection::Vertical => {
-                        // y_adjust is negative
+                        // y_adjust is negative. Once both sides are one row
+                        // tall, this split cannot shrink further; stop rather
+                        // than spin, because a parent split's recorded height
+                        // can exceed what this split is able to give up.
+                        if data.first.rows <= 1 && data.second.rows <= 1 {
+                            return;
+                        }
                         if data.first.rows > 1 {
                             adjust_y_size(&mut *left, -1, cell_dimensions);
                             data.first.rows -= 1;
@@ -2615,6 +2627,78 @@ mod test {
             }
             tab.adjust_pane_size(backward, 2);
             assert_eq!(tab.iter_splits()[1], before);
+        }
+    }
+
+    /// A split whose recorded width or height exceeds what its nested split
+    /// can give up: the shape a client receives for a tab whose server-side
+    /// split sizes disagree with the panes they contain. Shrinking it must
+    /// stop at the nested split's minimum instead of looping forever.
+    fn tree_with_nested_split_at_minimum(outer: SplitDirection) -> Tree {
+        let cell = TerminalSize {
+            rows: 1,
+            cols: 1,
+            pixel_width: 10,
+            pixel_height: 20,
+            dpi: 96,
+        };
+        let inner_direction = match outer {
+            SplitDirection::Horizontal => SplitDirection::Vertical,
+            SplitDirection::Vertical => SplitDirection::Horizontal,
+        };
+        let inner = Tree::Node {
+            left: Box::new(Tree::Leaf(FakePane::new(2, cell))),
+            right: Box::new(Tree::Leaf(FakePane::new(3, cell))),
+            data: Some(SplitDirectionAndSize {
+                direction: inner_direction,
+                first: cell,
+                second: cell,
+            }),
+        };
+        let wide = TerminalSize {
+            rows: 40,
+            cols: 40,
+            pixel_width: 400,
+            pixel_height: 800,
+            dpi: 96,
+        };
+        Tree::Node {
+            left: Box::new(Tree::Leaf(FakePane::new(1, wide))),
+            right: Box::new(inner),
+            data: Some(SplitDirectionAndSize {
+                direction: outer,
+                first: wide,
+                second: wide,
+            }),
+        }
+    }
+
+    #[test]
+    fn shrinking_past_a_nested_split_minimum_terminates() {
+        let cell = TerminalSize {
+            rows: 1,
+            cols: 1,
+            pixel_width: 10,
+            pixel_height: 20,
+            dpi: 96,
+        };
+        for outer in [SplitDirection::Horizontal, SplitDirection::Vertical] {
+            let mut tree = tree_with_nested_split_at_minimum(outer);
+            match outer {
+                SplitDirection::Horizontal => adjust_y_size(&mut tree, -10, &cell),
+                SplitDirection::Vertical => adjust_x_size(&mut tree, -10, &cell),
+            }
+            let Tree::Node { right, .. } = &tree else {
+                panic!("outer split replaced");
+            };
+            let Tree::Node {
+                data: Some(inner), ..
+            } = &**right
+            else {
+                panic!("inner split replaced");
+            };
+            assert_eq!((inner.first.cols, inner.first.rows), (1, 1));
+            assert_eq!((inner.second.cols, inner.second.rows), (1, 1));
         }
     }
 
