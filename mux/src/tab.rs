@@ -817,6 +817,10 @@ impl TabInner {
         self.pane.replace(cursor.tree());
         self.zoomed = zoomed;
         self.size = size;
+        // The split sizes in `root` lay the panes out at `size`. A zoom made
+        // by another client arrives here rather than through toggle_zoom, so
+        // record `size` as the layout an unzoom starts from.
+        self.size_before_zoom = size;
 
         self.resize(size);
 
@@ -2699,6 +2703,105 @@ mod test {
             };
             assert_eq!((inner.first.cols, inner.first.rows), (1, 1));
             assert_eq!((inner.second.cols, inner.second.rows), (1, 1));
+        }
+    }
+
+    fn remote_pane_entry(
+        pane_id: PaneId,
+        size: TerminalSize,
+        left_col: usize,
+        zoomed: bool,
+    ) -> PaneNode {
+        PaneNode::Leaf(PaneEntry {
+            window_id: 0,
+            tab_id: 0,
+            pane_id,
+            title: String::new(),
+            size,
+            working_dir: None,
+            is_active_pane: zoomed,
+            is_zoomed_pane: zoomed,
+            workspace: "default".to_string(),
+            cursor_pos: StableCursorPosition::default(),
+            physical_top: 0,
+            top_row: 0,
+            left_col,
+            tty_name: None,
+        })
+    }
+
+    fn cells(cols: usize, rows: usize) -> TerminalSize {
+        TerminalSize {
+            cols,
+            rows,
+            pixel_width: cols * 10,
+            pixel_height: rows * 20,
+            dpi: 96,
+        }
+    }
+
+    /// The server's tree for a `left | right` tab of `size`, as a client
+    /// receives it in a pane list.
+    fn remote_side_by_side(size: TerminalSize, right_zoomed: bool) -> PaneNode {
+        let left_cols = size.cols / 2;
+        let first = cells(left_cols, size.rows);
+        let second = cells(size.cols - left_cols - 1, size.rows);
+        PaneNode::Split {
+            left: Box::new(remote_pane_entry(1, first, 0, false)),
+            right: Box::new(remote_pane_entry(2, second, left_cols + 1, right_zoomed)),
+            node: SplitDirectionAndSize {
+                direction: SplitDirection::Horizontal,
+                first,
+                second,
+            },
+        }
+    }
+
+    /// A client's tab learns about a zoom made by another client through
+    /// sync_with_pane_tree. Unzooming it locally (unzoom_on_switch_pane, or
+    /// TogglePaneZoomState) must lay the panes out at the tab's size, not
+    /// shift them by the difference from the size the tab was created at.
+    #[test]
+    fn unzooming_a_zoom_made_by_another_client_fills_the_tab() {
+        let window = cells(120, 40);
+        // The tab was first seen smaller, then larger, than the window.
+        for first_seen in [cells(80, 24), cells(200, 60)] {
+            let tab = Tab::new(&first_seen);
+            let mut panes: HashMap<PaneId, Arc<dyn Pane>> = HashMap::new();
+            let mut make_pane = |entry: PaneEntry| -> Arc<dyn Pane> {
+                Arc::clone(
+                    panes
+                        .entry(entry.pane_id)
+                        .or_insert_with(|| FakePane::new(entry.pane_id, entry.size)),
+                )
+            };
+            tab.sync_with_pane_tree(
+                first_seen,
+                remote_side_by_side(first_seen, false),
+                &mut make_pane,
+            );
+            tab.resize(window);
+            tab.sync_with_pane_tree(window, remote_side_by_side(window, true), &mut make_pane);
+            assert!(tab.get_zoomed_pane().is_some());
+
+            tab.set_zoomed(false);
+
+            let panes = tab.iter_panes();
+            assert_eq!(panes.len(), 2);
+            assert_eq!(
+                (panes[0].left, panes[0].height, panes[1].height),
+                (0, 40, 40),
+                "first seen at {}x{}",
+                first_seen.cols,
+                first_seen.rows
+            );
+            assert_eq!(
+                panes[1].left + panes[1].width,
+                120,
+                "first seen at {}x{}",
+                first_seen.cols,
+                first_seen.rows
+            );
         }
     }
 

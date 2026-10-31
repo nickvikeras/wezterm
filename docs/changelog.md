@@ -160,6 +160,11 @@ As features stabilize some brief notes about them will accumulate here.
   `CTRL-u` to kill back to the start of the line. Thanks to @bew! #8013
 
 #### Fixed
+* mux: Unzooming a pane in a client domain no longer lays the tab out too
+  large or too small when another client made the zoom. The client recorded
+  no pre-zoom size for such a zoom, so the unzoom resized the panes by the
+  difference from the size the tab had when the client first saw it, and sent
+  those sizes to the server for every client.
 * mux: Pane focus no longer gets stuck switching back and forth between two
   panes after two quick focus changes, which also flickered the window title
   and could freeze the GUI while its memory grew. The client ignores a
